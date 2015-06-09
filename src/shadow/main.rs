@@ -42,7 +42,7 @@ impl Vertex {
 const MAX_LIGHTS: usize = 10;
 
 #[derive(Clone, Copy, Debug)]
-struct LightParam {
+pub struct LightParam {
     pos: [f32; 4],
     color: [f32; 4],
     proj: [[f32; 4]; 4],
@@ -53,7 +53,7 @@ gfx_parameters!( ForwardParams {
     u_ModelTransform@ model_transform: [[f32; 4]; 4],
     u_Color@ color: [f32; 4],
     u_NumLights@ num_lights: i32,
-    b_Lights@ light_buf: gfx::handle::RawBuffer<R>,
+    b_Lights@ light_buf: gfx::handle::Buffer<R, LightParam>,
     t_Shadow@ shadow: gfx::shade::TextureParam<R>,
 });
 
@@ -152,8 +152,8 @@ struct Light<S> {
 struct Entity<R: gfx::Resources> {
     dynamic: bool,
     mx_to_world: cgmath::Matrix4<f32>,
-    batch_shadow: gfx::batch::OwnedBatch<ShadowParams<R>>,
-    batch_forward: gfx::batch::OwnedBatch<ForwardParams<R>>,
+    batch_shadow: gfx::batch::Full<ShadowParams<R>>,
+    batch_forward: gfx::batch::Full<ForwardParams<R>>,
 }
 
 struct Scene<R: gfx::Resources, S> {
@@ -182,11 +182,11 @@ fn make_entity<R: gfx::Resources>(dynamic: bool, mesh: &gfx::Mesh<R>, slice: &gf
                 model_transform: cgmath::Matrix4::identity().into_fixed(),
                 color: [1.0, 1.0, 1.0, 1.0],
                 num_lights: num_lights as i32,
-                light_buf: light_buf.raw().clone(),
+                light_buf: light_buf.clone(),
                 shadow: shadow.clone(),
                 _r: std::marker::PhantomData,
             };
-            let mut batch = gfx::batch::OwnedBatch::new(
+            let mut batch = gfx::batch::Full::new(
                 mesh.clone(), prog_fw.clone(), data).unwrap();
             batch.slice = slice.clone();
             // forward pass is using depth test + write
@@ -198,12 +198,13 @@ fn make_entity<R: gfx::Resources>(dynamic: bool, mesh: &gfx::Mesh<R>, slice: &gf
                 transform: cgmath::Matrix4::identity().into_fixed(),
                 _r: std::marker::PhantomData,
             };
-            let mut batch = gfx::batch::OwnedBatch::new(
+            let mut batch = gfx::batch::Full::new(
                 mesh.clone(), prog_sh.clone(), data).unwrap();
             batch.slice = slice.clone();
             // shadow pass is also depth testing and writing
             batch.state = batch.state.depth(gfx::state::Comparison::LessEqual, true);
-            // need to offset the shadow depth a bit to prevent self-shadowing
+            // need to offset the shadow depth to prevent self-shadowing
+            // offset = 2, because we are using bilinear filtering
             batch.state.primitive.offset = Some(gfx::state::Offset(2.0, 2));
             batch
         },
@@ -232,7 +233,7 @@ fn create_scene<D, F>(_: &D, factory: &mut F)
         height: 512,
         depth: MAX_LIGHTS as gfx::tex::Size,
         levels: 1,
-        kind: gfx::tex::TextureKind::Texture2DArray,
+        kind: gfx::tex::Kind::D2Array,
         format: gfx::tex::Format::DEPTH24,
     }).unwrap();
 
@@ -301,9 +302,7 @@ fn create_scene<D, F>(_: &D, factory: &mut F)
             gfx::tex::FilterMethod::Bilinear,
             gfx::tex::WrapMode::Clamp
         );
-        sinfo.comparison = gfx::tex::ComparisonMode::CompareRefToTexture(
-            gfx::state::Comparison::LessEqual
-        );
+        sinfo.comparison = Some(gfx::state::Comparison::LessEqual);
         let sampler = factory.create_sampler(sinfo);
         (shadow_array.clone(), Some(sampler))
     };
@@ -461,7 +460,7 @@ pub fn main() {
             let (sender_orig, receiver) = mpsc::channel();
             let num = scene.lights.len();
             // run parallel threads
-            let threads: Vec<_> = (0..num).map(|_| {
+            let _threads: Vec<_> = (0..num).map(|_| {
                 // move the light into the thread scope
                 let mut light = scene.lights.swap_remove(0);
                 let entities = scene.entities.clone();
@@ -476,7 +475,7 @@ pub fn main() {
                     // fill
                     for ent in entities.read().unwrap().iter() {
                         let mut batch = ent.batch_shadow.clone();
-                        batch.param.transform = {
+                        batch.params.transform = {
                             let mx_proj: cgmath::Matrix4<_> = light.projection.into();
                             let mx_view = mx_proj.mul_m(&light.mx_view);
                             let mvp = mx_view.mul_m(&ent.mx_to_world);
@@ -487,9 +486,8 @@ pub fn main() {
                     sender.send(light).unwrap();
                 })
             }).collect();
-            // wait for them
-            drop(threads);
-            // execute the results, obtain the lights back
+            // wait for the results and execute them
+            // put the lights back into the scene
             for _ in 0..num {
                 let mut light = receiver.recv().unwrap();
                 light.stream.flush(&mut device);
@@ -506,7 +504,7 @@ pub fn main() {
                 // fill
                 for ent in scene.entities.read().unwrap().iter() {
                     let mut batch = ent.batch_shadow.clone();
-                    batch.param.transform = {
+                    batch.params.transform = {
                         let mx_proj: cgmath::Matrix4<_> = light.projection.into();
                         let mx_view = mx_proj.mul_m(&light.mx_view);
                         let mvp = mx_view.mul_m(&ent.mx_to_world);
@@ -535,8 +533,8 @@ pub fn main() {
 
         for ent in scene.entities.write().unwrap().iter_mut() {
             let batch = &mut ent.batch_forward;
-            batch.param.transform = mx_vp.mul_m(&ent.mx_to_world).into_fixed();
-            batch.param.model_transform = ent.mx_to_world.into_fixed();
+            batch.params.transform = mx_vp.mul_m(&ent.mx_to_world).into_fixed();
+            batch.params.model_transform = ent.mx_to_world.into_fixed();
             stream.draw(batch).unwrap();
         }
 
